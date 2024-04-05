@@ -8,16 +8,19 @@
     render(schema::AbstractAnthropicSchema,
         messages::Vector{<:AbstractMessage};
         conversation::AbstractVector{<:AbstractMessage} = AbstractMessage[],
+        tool_description::AbstractString = "",
         kwargs...)
 
 Builds a history of the conversation to provide the prompt to the API. All unspecified kwargs are passed as replacements such that `{{key}}=>value` in the template.
 
 # Keyword Arguments
 - `conversation`: Past conversation to be included in the beginning of the prompt (for continued conversations).
+- `tool_definition`: Description of the tools available to the user (see `?tool_xml_signature`)
 """
 function render(schema::AbstractAnthropicSchema,
         messages::Vector{<:AbstractMessage};
         conversation::AbstractVector{<:AbstractMessage} = AbstractMessage[],
+        tool_definition::AbstractString = "",
         kwargs...)
     ## 
     @assert count(issystemmessage, messages)<=1 "AbstractAnthropicSchema only supports at most 1 System message"
@@ -25,7 +28,8 @@ function render(schema::AbstractAnthropicSchema,
     system = nothing
 
     ## First pass: keep the message types but make the replacements provided in `kwargs`
-    messages_replaced = render(NoSchema(), messages; conversation, kwargs...)
+    messages_replaced = render(
+        NoSchema(), messages; conversation, kwargs...)
 
     ## Second pass: convert to the message-based schema
     conversation = Dict{String, Any}[]
@@ -47,6 +51,21 @@ function render(schema::AbstractAnthropicSchema,
         end
         # Note: Ignores any DataMessage or other types
     end
+
+    ## Add Tool definitions to the System Prompt
+    if !isempty(tool_definition)
+        tool_msg = replace(ANTHROPIC_TOOL_PROMPT, "{{tool_definition}}" => tool_definition)
+        if occursin("<type>List", tool_definition)
+            tool_msg *= "\n\n" * ANTHROPIC_TOOL_PROMPT_LIST_EXTRA
+        end
+        ## Add to system message
+        if isnothing(system)
+            system = tool_msg
+        else
+            system *= "\n\n" * tool_msg
+        end
+    end
+
     ## Sense check
     @assert !isempty(conversation) "AbstractAnthropicSchema requires at least 1 User message, ie, no `prompt` provided!"
 
@@ -244,6 +263,69 @@ function aigenerate(
     return output
 end
 
+function aaiextract(prompt_schema::AbstractAnthropicSchema, prompt::ALLOWED_PROMPT_TYPE;
+        return_type::Type,
+        verbose::Bool = true,
+        api_key::String = ANTHROPIC_API_KEY,
+        model::String = MODEL_CHAT,
+        return_all::Bool = false, dry_run::Bool = false,
+        conversation::AbstractVector{<:AbstractMessage} = AbstractMessage[],
+        http_kwargs::NamedTuple = (retry_non_idempotent = true,
+            retries = 5,
+            readtimeout = 120), api_kwargs::NamedTuple = NamedTuple(),
+        kwargs...)
+    ##
+    global MODEL_ALIASES
+
+    ## Find the unique ID for the model alias provided
+    model_id = get(MODEL_ALIASES, model, model)
+
+    ## Add the function call stopping sequence to the api_kwargs
+    api_kwargs = merge(api_kwargs, (; stop_sequences = ["</function_calls>"]))
+
+    ## Tools definition
+    tool_definition = tool_xml_signature(return_type)
+
+    ## We provide the tool description to the rendering engine
+    conv_rendered = render(prompt_schema, prompt; conversation, tool_definition, kwargs...)
+
+    if !dry_run
+        time = @elapsed resp = anthropic_api(
+            prompt_schema, conv_rendered.conversation; api_key,
+            conv_rendered.system, endpoint = "messages", model = model_id, http_kwargs,
+            api_kwargs...)
+        tokens_prompt = get(resp.response[:usage], :input_tokens, 0)
+        tokens_completion = get(resp.response[:usage], :output_tokens, 0)
+        content = mapreduce(x -> get(x, :text, ""), *, resp.response[:content]) |> strip
+
+        ## Convert the text response to object
+        typed_content = xml_to_return_type(content, return_type)
+
+        ## Build data message
+        msg = DataMessage(; content = typed_content,
+            status = Int(resp.status),
+            cost = call_cost(tokens_prompt, tokens_completion, model_id),
+            finish_reason = get(resp.response, :stop_reason, nothing),
+            tokens = (tokens_prompt, tokens_completion),
+            elapsed = time)
+
+        ## Reporting
+        verbose && @info _report_stats(msg, model_id)
+    else
+        msg = nothing
+    end
+    ## Select what to return
+    output = finalize_outputs(prompt,
+        conv_rendered,
+        msg;
+        conversation,
+        return_all,
+        dry_run,
+        kwargs...)
+
+    return output
+end
+
 function aiembed(prompt_schema::AbstractAnthropicSchema, prompt::ALLOWED_PROMPT_TYPE;
         kwargs...)
     error("Anthropic schema does not yet support aiembed. Please use OpenAISchema instead.")
@@ -251,10 +333,6 @@ end
 function aiclassify(prompt_schema::AbstractAnthropicSchema, prompt::ALLOWED_PROMPT_TYPE;
         kwargs...)
     error("Anthropic schema does not yet support aiclassify. Please use OpenAISchema instead.")
-end
-function aiextract(prompt_schema::AbstractAnthropicSchema, prompt::ALLOWED_PROMPT_TYPE;
-        kwargs...)
-    error("Anthropic schema does not yet support aiextract. Please use OpenAISchema instead.")
 end
 function aiscan(prompt_schema::AbstractAnthropicSchema, prompt::ALLOWED_PROMPT_TYPE;
         kwargs...)
