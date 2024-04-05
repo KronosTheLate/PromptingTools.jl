@@ -263,7 +263,7 @@ function aigenerate(
     return output
 end
 
-function aaiextract(prompt_schema::AbstractAnthropicSchema, prompt::ALLOWED_PROMPT_TYPE;
+function aiextract(prompt_schema::AbstractAnthropicSchema, prompt::ALLOWED_PROMPT_TYPE;
         return_type::Type,
         verbose::Bool = true,
         api_key::String = ANTHROPIC_API_KEY,
